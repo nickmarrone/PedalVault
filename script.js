@@ -503,9 +503,9 @@ function importInventory(event) {
                 parsed.data.forEach(row => {
                     // Normalize headers
                     const id = row['Part ID'] || row['part id'] || row['ID'] || row['id'] || normalizeValue(row['Name'] || row['name'] || '');
-                    const name = row['Name'] || row['name'] || '';
+                    let name = row['Name'] || row['name'] || '';
                     if (!name) return; // skip if no name
-                    const type = row['Type'] || row['type'] || '';
+                    let type = row['Type'] || row['type'] || '';
                     const quantity = parseInt(row['Quantity'] || row['quantity'] || '0') || 0;
                     const purchaseUrl = row['Purchase URL'] || row['purchase url'] || '';
                     let projects = {};
@@ -516,12 +516,21 @@ function importInventory(event) {
                             if (pid) projects[pid] = qty ? parseInt(qty) || 0 : 0;
                         });
                     }
-                    importedData[id] = {
-                        name: name,
-                        type: type || undefined,
-                        quantity: quantity,
-                        purchaseUrl: purchaseUrl,
-                        projects: projects
+                    
+                    // Process capacitor name and extract type if needed
+                    const processed = processCapacitorName(name, type);
+                    name = processed.name;
+                    type = processed.type;
+                    
+                    importedData = { 
+                        ...importedData, 
+                        [id]: {
+                            name: name,
+                            type: type || undefined,
+                            quantity: quantity,
+                            purchaseUrl: purchaseUrl,
+                            projects: projects
+                        }
                     };
                 });
             } else {
@@ -1721,6 +1730,11 @@ function createProjectFromBom(projectName, projectId, bom) {
                 inventory[partId].projects = {};
             }
             inventory[partId].projects[projectId] = bom[id].quantity;
+            
+            // Update capacitor type if we have new information and the part doesn't have a type
+            if (bom[id].capacitorType && !inventory[partId].type) {
+                inventory[partId].type = bom[id].capacitorType;
+            }
         } else {
             // Create the part if it doesn't exist
             inventory[id] = {
@@ -1728,7 +1742,8 @@ function createProjectFromBom(projectName, projectId, bom) {
                 quantity: 0,
                 projects: {
                     [projectId]: bom[id].quantity
-                }
+                },
+                type: bom[id].capacitorType || undefined
             };
         }
     }
@@ -1855,11 +1870,16 @@ function compareBOM(event) {
                 parsed.data.forEach((row, index) => {
                     // Normalize headers
                     let id = row['Part ID'] || row['part id'] || row['ID'] || row['id'] || '';
-                    const name = row['Name'] || row['name'] || row['Part Name'] || row['part name'] || row['Component'] || row['component'] || '';
+                    let name = row['Name'] || row['name'] || row['Part Name'] || row['part name'] || row['Component'] || row['component'] || '';
                     if (!name) {
                         return; // skip if no name
                     }
                     const quantity = parseInt(row['Quantity'] || row['quantity'] || '0') || 0;
+                    
+                    // Process capacitor name and extract type if needed
+                    const processed = processCapacitorName(name);
+                    name = processed.name;
+                    const capacitorType = processed.type;
                     
                     // If no explicit ID provided, try to find matching part in inventory first
                     if (!id) {
@@ -1889,7 +1909,8 @@ function compareBOM(event) {
                     
                     bom[id] = {
                         name: name,
-                        quantity: quantity
+                        quantity: quantity,
+                        capacitorType: capacitorType
                     };
                 });
             } else {
@@ -1901,14 +1922,37 @@ function compareBOM(event) {
                         if (part.name && part.quantity !== undefined) {
                             // Use normalized name as ID
                             const id = normalizeValue(part.name);
-                            bom[id] = { name: part.name, quantity: part.quantity };
+                            let name = part.name;
+                            
+                            // Process capacitor name and extract type if needed
+                            const processed = processCapacitorName(name);
+                            name = processed.name;
+                            const capacitorType = processed.type;
+                            
+                            bom[id] = { 
+                                name: name, 
+                                quantity: part.quantity,
+                                capacitorType: capacitorType
+                            };
                         }
                     });
                 } else {
                     // Handle flat object format
                     for (const id in parsedBom) {
                         if (parsedBom[id] && parsedBom[id].quantity !== undefined) {
-                            bom[id] = parsedBom[id];
+                            let part = parsedBom[id];
+                            let name = part.name;
+                            
+                            // Process capacitor name and extract type if needed
+                            const processed = processCapacitorName(name);
+                            name = processed.name;
+                            const capacitorType = processed.type;
+                            
+                            bom[id] = {
+                                ...part,
+                                name: name,
+                                capacitorType: capacitorType
+                            };
                         }
                     }
                 }
@@ -1940,7 +1984,8 @@ function addMissingParts() {
                 name: part.name,
                 quantity: 0,
                 purchaseUrl: part.purchaseUrl || '',
-                projects: {}
+                projects: {},
+                type: part.capacitorType || undefined
             };
             addedCount++;
         }
@@ -2630,8 +2675,57 @@ function suggestCapacitorType(partName) {
     // Suggest type based on value in uF
     if (valueUF <= 0.001) return 'MLCC'; // ≤1nF
     if (valueUF > 0.001 && valueUF <= 2.2) return 'Box Film'; // >1nF to 2.2uF
-    if (valueUF > 2.2) return 'Electrolytic';
+    if (valueUF > 2.2 && valueUF <= 100) return 'Tantalum'; // >2.2uF to 100uF (common tantalum range)
+    if (valueUF > 100) return 'Electrolytic'; // >100uF (typically electrolytic)
     return null;
+}
+
+// Extract capacitor type from part name and clean the name
+function extractCapacitorType(partName) {
+    // Look for capacitor type in parentheses at the end of the name
+    const typeMatch = partName.match(/\(([^)]+)\)\s*$/);
+    if (!typeMatch) return { name: partName, type: null };
+    
+    const type = typeMatch[1].trim();
+    const cleanName = partName.replace(/\s*\([^)]+\)\s*$/, '').trim();
+    
+    // Map common capacitor type descriptions to the app's type values
+    let mappedType = null;
+    if (type.toLowerCase().includes('ceramic') || type.toLowerCase().includes('mlcc')) {
+        mappedType = 'MLCC';
+    } else if (type.toLowerCase().includes('film') || type.toLowerCase().includes('box')) {
+        mappedType = 'Box Film';
+    } else if (type.toLowerCase().includes('electrolytic') || type.toLowerCase().includes('aluminum')) {
+        mappedType = 'Electrolytic';
+    } else if (type.toLowerCase().includes('tantalum')) {
+        mappedType = 'Tantalum';
+    } else {
+        // For unknown types, use "Other" or keep the original type
+        mappedType = 'Other';
+    }
+    
+    return { name: cleanName, type: mappedType };
+}
+
+// Utility function to process capacitor names and extract types
+function processCapacitorName(partName, existingType = null) {
+    // Only process if this is a capacitor with type information and no explicit type exists
+    if (!existingType && 
+        partName.toLowerCase().includes('capacitor') && 
+        partName.includes('(') && 
+        partName.includes(')')) {
+        const extracted = extractCapacitorType(partName);
+        return {
+            name: extracted.name,
+            type: extracted.type
+        };
+    }
+    
+    // Return original name and type if no processing needed
+    return {
+        name: partName,
+        type: existingType
+    };
 }
 
 // Utility to show/hide type dropdown and suggestion based on part name
@@ -2649,51 +2743,43 @@ function updateTypeDropdownVisibility(nameInput, typeDropdown, typeSuggestion) {
     }
 }
 
+// Utility function to set up capacitor type dropdown event listeners
+function setupCapacitorTypeDropdown(nameInput, typeDropdown, typeSuggestion) {
+    if (!nameInput || !typeDropdown || !typeSuggestion) return;
+    
+    // Initially hide the dropdown and suggestion
+    typeDropdown.classList.add('hidden');
+    typeSuggestion.classList.add('hidden');
+    
+    // Add event listener for input changes
+    nameInput.addEventListener('input', () => {
+        updateTypeDropdownVisibility(nameInput, typeDropdown, typeSuggestion);
+        const suggestion = suggestCapacitorType(nameInput.value);
+        
+        if (suggestion && !typeDropdown.classList.contains('hidden')) {
+            typeSuggestion.textContent = `Suggested type: ${suggestion}`;
+            if (!typeDropdown.value) {
+                for (const opt of typeDropdown.options) {
+                    if (opt.value === suggestion) typeDropdown.value = suggestion;
+                }
+            }
+        } else if (!typeDropdown.classList.contains('hidden')) {
+            typeSuggestion.textContent = '';
+        }
+    });
+}
+
 // Add Part Modal: Show/hide type dropdown
 const newPartNameInput = document.getElementById('newPartName');
 const newPartTypeDropdown = document.getElementById('newPartType');
 const newPartTypeSuggestion = document.getElementById('newPartTypeSuggestion');
-if (newPartNameInput && newPartTypeDropdown && newPartTypeSuggestion) {
-    newPartTypeDropdown.classList.add('hidden');
-    newPartTypeSuggestion.classList.add('hidden');
-    newPartNameInput.addEventListener('input', () => {
-        updateTypeDropdownVisibility(newPartNameInput, newPartTypeDropdown, newPartTypeSuggestion);
-        const suggestion = suggestCapacitorType(newPartNameInput.value);
-        if (suggestion && !newPartTypeDropdown.classList.contains('hidden')) {
-            newPartTypeSuggestion.textContent = `Suggested type: ${suggestion}`;
-            if (!newPartTypeDropdown.value) {
-                for (const opt of newPartTypeDropdown.options) {
-                    if (opt.value === suggestion) newPartTypeDropdown.value = suggestion;
-                }
-            }
-        } else if (!newPartTypeDropdown.classList.contains('hidden')) {
-            newPartTypeSuggestion.textContent = '';
-        }
-    });
-}
+setupCapacitorTypeDropdown(newPartNameInput, newPartTypeDropdown, newPartTypeSuggestion);
 
 // Edit Part Modal: Show/hide type dropdown
 const editPartNameInput = document.getElementById('editPartName');
 const editPartTypeDropdown = document.getElementById('editPartType');
 const editPartTypeSuggestion = document.getElementById('editPartTypeSuggestion');
-if (editPartNameInput && editPartTypeDropdown && editPartTypeSuggestion) {
-    editPartTypeDropdown.classList.add('hidden');
-    editPartTypeSuggestion.classList.add('hidden');
-    editPartNameInput.addEventListener('input', () => {
-        updateTypeDropdownVisibility(editPartNameInput, editPartTypeDropdown, editPartTypeSuggestion);
-        const suggestion = suggestCapacitorType(editPartNameInput.value);
-        if (suggestion && !editPartTypeDropdown.classList.contains('hidden')) {
-            editPartTypeSuggestion.textContent = `Suggested type: ${suggestion}`;
-            if (!editPartTypeDropdown.value) {
-                for (const opt of editPartTypeDropdown.options) {
-                    if (opt.value === suggestion) editPartTypeDropdown.value = suggestion;
-                }
-            }
-        } else if (!editPartTypeDropdown.classList.contains('hidden')) {
-            editPartTypeSuggestion.textContent = '';
-        }
-    });
-}
+setupCapacitorTypeDropdown(editPartNameInput, editPartTypeDropdown, editPartTypeSuggestion);
 
 // ... existing code ...
 function normalizeAllBOMReferences() {
@@ -3184,4 +3270,97 @@ function flushPendingOperations() {
             }
         });
     }, { timeout: 1000 });
+}
+
+// Process pasted BOM text from the BOM Assistant modal
+function processPastedBOM() {
+    const bomText = document.getElementById('bomTextInput').value.trim();
+    if (!bomText) {
+        showNotification('Please paste BOM data first', 'error');
+        return;
+    }
+    
+    try {
+        // Parse the pasted CSV text
+        const parsed = Papa.parse(bomText, { header: true, skipEmptyLines: true });
+        if (parsed.errors.length) {
+            throw new Error('CSV parse error: ' + parsed.errors[0].message);
+        }
+        
+        let bom = {};
+        parsed.data.forEach((row, index) => {
+            // Normalize headers
+            let id = row['Part ID'] || row['part id'] || row['ID'] || row['id'] || '';
+            let name = row['Name'] || row['name'] || row['Part Name'] || row['part name'] || row['Component'] || row['component'] || '';
+            if (!name) {
+                return; // skip if no name
+            }
+            const quantity = parseInt(row['Quantity'] || row['quantity'] || '0') || 0;
+            
+            // Process capacitor name and extract type if needed
+            const processed = processCapacitorName(name);
+            name = processed.name;
+            const capacitorType = processed.type;
+            
+            if (!id) {
+                // Try to find exact match by name first
+                let foundId = null;
+                for (const [invId, invPart] of Object.entries(inventory)) {
+                    if (invPart.name.toLowerCase() === name.toLowerCase()) {
+                        foundId = invId;
+                        break;
+                    }
+                }
+                
+                // If no exact match, try normalized matching
+                if (!foundId) {
+                    const normalizedName = normalizeValue(name);
+                    for (const [invId, invPart] of Object.entries(inventory)) {
+                        if (normalizeValue(invPart.name) === normalizedName) {
+                            foundId = invId;
+                            break;
+                        }
+                    }
+                }
+                
+                // Use found ID or create a normalized one as fallback
+                id = foundId || normalizeValue(name);
+            }
+            
+            bom[id] = {
+                name: name,
+                quantity: quantity,
+                capacitorType: capacitorType
+            };
+        });
+        
+        if (Object.keys(bom).length === 0) {
+            throw new Error('No valid BOM data found');
+        }
+        
+        // Store the BOM data and show the project name modal
+        pendingBomData = bom;
+        hideBOMAssistantModal();
+        showProjectNameModal();
+        
+    } catch (err) {
+        showNotification("Error processing pasted BOM: " + err.message, "error");
+    }
+}
+
+// Copy the BOM prompt template to clipboard
+function copyPromptTemplate() {
+    const promptText = document.getElementById('promptTemplate').textContent;
+    navigator.clipboard.writeText(promptText).then(() => {
+        showNotification('Prompt template copied to clipboard!', 'success');
+    }).catch(() => {
+        // Fallback for older browsers
+        const textArea = document.createElement('textarea');
+        textArea.value = promptText;
+        document.body.appendChild(textArea);
+        textArea.select();
+        document.execCommand('copy');
+        document.body.removeChild(textArea);
+        showNotification('Prompt template copied to clipboard!', 'success');
+    });
 }
